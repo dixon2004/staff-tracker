@@ -100,9 +100,82 @@ def detect_and_score(video: Path, progress=None) -> pd.DataFrame:
     return df
 
 
+def _best_path(s: pd.DataFrame, weight: np.ndarray, max_speed: float) -> pd.DataFrame:
+    """
+    Keep the chain of candidates that one person could really walk, with the highest total weight.
+
+    Args:
+        s (pd.DataFrame): Candidate boxes sorted by frame, with x and y centre columns.
+        weight (np.ndarray): How much each candidate is worth keeping.
+        max_speed (float): Furthest a person can move between frames, in pixels.
+
+    Returns:
+        pd.DataFrame: The candidates on the best chain, at most one per frame.
+    """
+    if s.empty:
+        return s
+    f, x, y = s.frame.to_numpy(), s.x.to_numpy(), s.y.to_numpy()
+    best = weight.copy()
+    prev = np.full(len(s), -1)
+    for i in range(len(s)):
+        j = np.flatnonzero((f[:i] < f[i]) & (np.hypot(x[:i] - x[i], y[:i] - y[i]) <= max_speed * (f[i] - f[:i])))
+        if len(j):
+            prev[i] = j[best[j].argmax()]
+            best[i] += best[prev[i]]
+    keep, i = [], int(best.argmax())
+    while i >= 0:
+        keep.append(i)
+        i = prev[i]
+    return s.iloc[keep[::-1]]
+
+
+def _moving_boxes(dets: pd.DataFrame, max_gap: int, max_speed: float) -> pd.DataFrame:
+    """
+    Drop boxes that stay in one place, such as seated people, and small boxes that only cover part of a person.
+
+    Args:
+        dets (pd.DataFrame): All person boxes in frame order, with x and y centre columns.
+        max_gap (int): How many frames to look before and after each box.
+        max_speed (float): Furthest a person can move between frames, in pixels.
+
+    Returns:
+        pd.DataFrame: The large enough boxes with few other boxes at the same spot nearby in time.
+    """
+    f, x, y = dets.frame.to_numpy(), dets.x.to_numpy(), dets.y.to_numpy()
+    lo, hi = np.searchsorted(f, f - max_gap), np.searchsorted(f, f + max_gap, side="right")
+    near = [(np.hypot(x[a:b] - x[i], y[a:b] - y[i]) < max_speed / 2).sum() for i, (a, b) in enumerate(zip(lo, hi))]
+    return dets[(np.array(near, int) < max_gap) & (np.hypot(dets.x2 - dets.x1, dets.y2 - dets.y1) > 1.5 * max_speed)]
+
+
+def _fill_gaps(s: pd.DataFrame, dets: pd.DataFrame, max_gap: int, max_speed: float) -> pd.DataFrame:
+    """
+    Fill short gaps in the path with real boxes of moving people, so the box follows the person.
+
+    These boxes have no tag evidence, so they must fit a stricter speed limit than the path itself.
+
+    Args:
+        s (pd.DataFrame): The staff path, sorted by frame.
+        dets (pd.DataFrame): All person boxes in frame order, with x and y centre columns.
+        max_gap (int): Longest gap to fill, in frames.
+        max_speed (float): Furthest a person can move between frames, in pixels.
+
+    Returns:
+        pd.DataFrame: The path with the extra boxes added, sorted by frame.
+    """
+    extra = _moving_boxes(dets, max_gap, max_speed)
+    filled = [s]
+    f = s.frame.to_numpy()
+    for i in np.flatnonzero((np.diff(f) > 1) & (np.diff(f) <= max_gap + 1)):
+        seg = pd.concat([s.iloc[[i]], extra[extra.frame.between(f[i] + 1, f[i + 1] - 1)], s.iloc[[i + 1]]])
+        path = _best_path(seg, 1 + 1000 * seg.index.isin(s.index), max_speed * 0.65)
+        if path.frame.iloc[0] == f[i] and path.frame.iloc[-1] == f[i + 1]:
+            filled.append(path.iloc[1:-1])
+    return pd.concat(filled).sort_values("frame")
+
+
 def identify_staff(
         dets: pd.DataFrame, n_frames: int, tag_thresh: float = 0.2,
-        reach: int = 100, min_hits: int = 2, strong: float = 0.5, max_gap: int = 12
+        reach: int = 100, min_hits: int = 2, strong: float = 0.3, max_gap: int = 50, max_speed: float = 0.45
         ) -> pd.DataFrame:
     """
     Identify the staff member from the detection results.
@@ -114,20 +187,23 @@ def identify_staff(
         reach (int): How many frames before and after a sighting the staff label stays on a track.
         min_hits (int): Minimum number of frames with tag detection to consider a track as staff.
         strong (float): Confidence threshold for strong tag detection.
-        max_gap (int): Maximum gap of missing frames to interpolate.
+        max_gap (int): Longest gap of missing frames to fill.
+        max_speed (float): Furthest the staff member can move between frames, as a share of a typical person box diagonal.
 
     Returns:
-        pd.DataFrame: A DataFrame containing the identified staff member's bounding boxes and tag information for each frame, with short gaps interpolated.
+        pd.DataFrame: A DataFrame containing the identified staff member's bounding boxes and tag information for each frame, with short gaps filled.
     """
+    dets = dets.assign(x=(dets.x1 + dets.x2) / 2, y=(dets.y1 + dets.y2) / 2)
     d = dets[dets.tid >= 0].assign(gap=np.inf)
     for tid, hits in d[d.tag_conf >= tag_thresh].groupby("tid"):
         if len(hits) >= min_hits and hits.tag_conf.max() >= strong:
             t = d[d.tid == tid]
             d.loc[t.index, "gap"] = np.abs(t.frame.to_numpy()[:, None] - hits.frame.to_numpy()[None, :]).min(1)
 
-    s = d[d.gap <= reach]
-    s = s.sort_values(["gap", "tag_conf"], ascending=[True, False]).drop_duplicates("frame")
-    s = s.assign(x=(s.x1 + s.x2) / 2, y=(s.y1 + s.y2) / 2)
+    s = d[d.gap <= reach].sort_values(["frame", "gap", "tag_conf"], ascending=[True, True, False])
+    limit = max_speed * np.hypot(d.x2 - d.x1, d.y2 - d.y1).median()
+    s = _best_path(s, 1 + 1000 * (s.tag_conf.to_numpy() >= tag_thresh), limit)
+    s = _fill_gaps(s, dets, max_gap, limit)
     cols = ["x", "y", "x1", "y1", "x2", "y2"]
     per_frame = pd.DataFrame({"frame": np.arange(n_frames)}).merge(
         s[["frame", "tid", *cols, "tag_conf", "tag_x", "tag_y"]], on="frame", how="left"

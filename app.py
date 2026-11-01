@@ -32,7 +32,7 @@ def show_progress(bar, label):
 
 key = cache_key(video)
 for f in CACHE.iterdir():
-    if f.is_file() and f != video and not f.name.startswith(key):
+    if f.is_file() and not f.samefile(video) and not f.name.startswith(key):
         f.unlink()
 
 bar = st.progress(0.0, text="Detecting people and tags…")

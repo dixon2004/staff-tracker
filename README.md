@@ -23,10 +23,13 @@ video ─► find people ─► track people ─► find the name tag ─► pic
    tag positions from one sample video. Each tag is assigned to the one
    person it belongs to.
 4. **Pick the staff member.** A person becomes staff once the tag is seen on
-   them at least twice, with at least one confident sighting. The label then
+   them at least twice, with at least one clear sighting. The label then
    stays with that person for up to 100 frames (4 s) either side of a
    sighting, so they are still followed when they turn and the tag faces
-   away. Short gaps (up to 12 frames) are filled in.
+   away. Boxes that would need an impossible jump between frames are dropped,
+   keeping the path with the most tag sightings. Gaps of up to 50 frames (2 s)
+   are filled in, using boxes of moving people where they fit and estimated
+   positions elsewhere.
 
 The xy position is the centre of the staff member's bounding box, in image
 pixels.
